@@ -37,3 +37,23 @@ fn simple_call() {
 
     insta::assert_snapshot!(result, @"");
 }
+
+
+#[test]
+fn passing_a_string_to_a_function() {
+    let result = codegen(
+        r#"FUNCTION func : DINT
+            VAR_INPUT x : STRING[5]; END_VAR
+        END_FUNCTION
+
+        PROGRAM main
+            VAR a : STRING[5]; END_VAR
+
+            func(a);
+            func('12345');
+        END_PROGRAM
+        "#
+    );
+
+    insta::assert_snapshot!(result, @"");
+}

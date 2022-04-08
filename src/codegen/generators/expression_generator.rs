@@ -497,12 +497,11 @@ impl<'a, 'b> ExpressionCodeGenerator<'a, 'b> {
             }
         };
 
-        //foo(a)
         let function_name = implementation.get_call_name();
-        //Functions
         let parameters_data = if implementation.get_implementation_type()
             == &ImplementationType::Function
         {
+            //Functions
             let call_params = parameters
                 .as_ref()
                 .map(ast::flatten_expression_list)
@@ -516,48 +515,56 @@ impl<'a, 'b> ExpressionCodeGenerator<'a, 'b> {
                 .into_iter()
                 .filter(|it| it.is_parameter())
                 .collect::<Vec<_>>();
-            
+
             // the parameters to be passed to the function call
             let mut arguments = Vec::new();
             for (idx, param_statement) in call_params.into_iter().enumerate() {
-                let (location, param_statement) = if let AstStatement::Assignment { left, right, .. } = param_statement
-                {
-                    //explicit
-                    let loc = if let AstStatement::Reference {
-                        name: left_name, ..
-                    } = left.as_ref()
-                    {
-                        let position = declared_parameters
-                            .iter()
-                            .position(|p| p.get_name() == left_name);
-                        position.ok_or_else(|| {
-                            Diagnostic::unresolved_reference(left_name, left.get_location())
-                        })
+                let (location, param_statement) =
+                    if let AstStatement::Assignment { left, right, .. } = param_statement {
+                        //explicit
+                        let loc = if let AstStatement::Reference {
+                            name: left_name, ..
+                        } = left.as_ref()
+                        {
+                            let position = declared_parameters
+                                .iter()
+                                .position(|p| p.get_name() == left_name);
+                            position.ok_or_else(|| {
+                                Diagnostic::unresolved_reference(left_name, left.get_location())
+                            })
+                        } else {
+                            unreachable!("left of an assignment must be a reference");
+                        }?;
+
+                        (loc, right.as_ref())
                     } else {
-                        unreachable!("left of an assignment must be a reference");
-                    }?;
+                        //implicit
+                        (idx, param_statement)
+                    };
 
-                    (loc, right.as_ref())
+                let v = declared_parameters[location];
+
+                let parameter: BasicValueEnum = if v.get_declaration_type().is_by_ref() {
+                    self.generate_element_pointer(param_statement)
+                        .or_else::<Diagnostic, _>(|_| {
+                            let value = self.generate_expression(param_statement)?;
+                            let parameter = self.llvm.builder.build_alloca(value.get_type(), "");
+                            self.llvm.builder.build_store(parameter, value);
+                            Ok(parameter)
+                        })
+                        .map(Into::into)?
                 } else {
-                    //implicit
-                    (idx, param_statement)
+                    self.generate_expression(param_statement)?
                 };
-
-                let parameter : BasicValueEnum = self
-                    .generate_element_pointer(param_statement)
-                    .or_else::<Diagnostic, _>(|_| {
-                        let value = self.generate_expression(param_statement)?;
-                        let parameter = self.llvm.builder.build_alloca(value.get_type(), "");
-                        self.llvm.builder.build_store(parameter, value);
-                        Ok(parameter)
-                    })
-                    .map(Into::into)?;
 
                 arguments.push((location, parameter));
             }
             arguments.sort_by(|(idx_a, _), (idx_b, _)| idx_a.cmp(idx_b));
-            
-            arguments.into_iter().map(|(_, v)| v.into()).collect::<Vec<BasicMetadataValueEnum>>()
+
+            arguments
+                .into_iter()
+                .map(|(_, v)| v.into())
+                .collect::<Vec<BasicMetadataValueEnum>>()
         } else {
             // no function
             //First go to the input block
@@ -585,7 +592,7 @@ impl<'a, 'b> ExpressionCodeGenerator<'a, 'b> {
             .try_as_basic_value();
 
         //build output-parameters
-        if implementation.get_implementation_type() == &ImplementationType::Function {
+        if implementation.get_implementation_type() != &ImplementationType::Function {
             self.generate_output_function_parameters(function_name, call_ptr, parameters)?;
         }
 
@@ -1576,7 +1583,19 @@ impl<'a, 'b> ExpressionCodeGenerator<'a, 'b> {
                                 let literal = self.llvm_index.find_utf08_literal_string(value);
                                 if literal.is_some() && self.function_context.is_some() {
                                     //global constant string
-                                    Ok(literal.map(|it| it.as_basic_value_enum()).unwrap())
+                                    let literal_value = literal.unwrap().as_basic_value_enum();
+                                    //TODO should a string-literal be treated as an auto-deref String* ?
+                                    Ok(
+                                        if literal_value.is_pointer_value()
+                                            && !expected_type.is_pointer()
+                                        {
+                                            self.llvm
+                                                .builder
+                                                .build_load(literal_value.into_pointer_value(), "")
+                                        } else {
+                                            literal_value
+                                        },
+                                    )
                                 } else {
                                     //note that .len() will give us the number of bytes, not the number of characters
                                     let actual_length = value.chars().count() + 1; // +1 to account for a final \0
